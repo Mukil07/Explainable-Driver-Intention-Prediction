@@ -13,8 +13,7 @@ from utils.save_img import visualize
 from sklearn.metrics import accuracy_score, f1_score
 
 from model import build_model
-# NOTE: the original `from tools.engine import train, val` was already broken -- engine.py
-# has no `train`. Scoring now goes through score_model, so neither symbol is needed.
+
 from eval_daadx import pad_collate, score_model, BATCH
 
 def seed_all(seed):
