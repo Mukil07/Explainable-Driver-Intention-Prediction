@@ -10,11 +10,91 @@ import numpy as np
 from utils.loader import CustomDataset
 from utils.gradcam import GradCAM
 from utils.save_img import visualize
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 from model import build_model
 
-from eval_daadx import pad_collate, score_model, BATCH
+
+BATCH = 8
+
+
+def pad_collate(batch):
+    n = len(batch)
+    padded = list(batch) + [batch[-1]] * (BATCH - n)
+    img1 = torch.stack([b[0] for b in padded])
+    img2 = torch.stack([b[1] for b in padded])
+    cls = torch.tensor([b[2] for b in padded])
+    gaze = torch.tensor([b[3] for b in padded])
+    ego = torch.tensor([b[4] for b in padded], dtype=torch.float)
+    mask = torch.zeros(BATCH, dtype=torch.bool)
+    mask[:n] = True
+    return img1, img2, cls, gaze, ego, mask
+
+
+def score_model(model, loader, device, ego_threshold=0.5, dump=None):
+    crit_man = nn.CrossEntropyLoss()
+    crit_ego = nn.BCEWithLogitsLoss()
+
+    Lg_raw, Le_raw, Lm_raw = [], [], []
+    P, L = [], []
+    Pg, Lg = [], []
+    Pe, Le = [], []
+    running_loss, nb = 0.0, 0
+
+    with torch.no_grad():
+        for img1, img2, cls, gaze, ego, mask in tqdm(loader):
+            img1 = img1.to(device).float()
+            img2 = img2.to(device).float()
+            label = cls.to(device)
+            ego = ego.to(device)
+
+            outputs = model(img1, img2)
+
+            loss = crit_man(outputs[0], label) + 0.5 * crit_ego(
+                torch.hstack(outputs[2:]), ego
+            )
+            running_loss += loss.item()
+            nb += 1
+
+            m = mask.cpu()
+            P.append(torch.argmax(outputs[0], dim=1).cpu()[m])
+            L.append(cls[m])
+            Pg.append(torch.argmax(outputs[1], dim=1).cpu()[m])
+            Lg.append(gaze[m])
+            Pe.append((torch.sigmoid(torch.hstack(outputs[2:])) > ego_threshold).float().cpu()[m])
+            Le.append(ego.cpu()[m])
+            Lm_raw.append(outputs[0].cpu()[m])
+            Lg_raw.append(outputs[1].cpu()[m])
+            Le_raw.append(torch.hstack(outputs[2:]).cpu()[m])
+
+    y, yh = np.hstack(L), np.hstack(P)
+    yg, ygh = np.hstack(Lg), np.hstack(Pg)
+    ye, yeh = torch.cat(Le).numpy(), torch.cat(Pe).numpy()
+
+    print("\n" + "=" * 66)
+    print(f"scored samples: {len(y)}   batches: {nb}   mean loss: {running_loss/nb:.4f}")
+    print("=" * 66)
+    print("MANEUVER (7-way)")
+    print(f"  accuracy        {accuracy_score(y, yh):.4f}")
+    print(f"  f1 (weighted)   {f1_score(y, yh, average='weighted', zero_division=0):.4f}")
+    print(f"  f1 (macro)      {f1_score(y, yh, average='macro', zero_division=0):.4f}")
+    print("\nGAZE EXPLANATION (15-way)")
+    print(f"  accuracy        {accuracy_score(yg, ygh):.4f}")
+    print(f"  f1 (weighted)   {f1_score(yg, ygh, average='weighted', zero_division=0):.4f}")
+    print(f"\nEGO EXPLANATION (17 multilabel)  [threshold={ego_threshold}]")
+    print(f"  subset accuracy {accuracy_score(ye, yeh):.4f}")
+    print(f"  f1 (weighted)   {f1_score(ye, yeh, average='weighted', zero_division=0):.4f}")
+    print(f"  f1 (micro)      {f1_score(ye, yeh, average='micro', zero_division=0):.4f}")
+    print(f"  f1 (macro)      {f1_score(ye, yeh, average='macro', zero_division=0):.4f}")
+    if dump:
+        np.savez(dump, y=y, yh=yh, yg=yg, ygh=ygh, ye=ye, yeh=yeh,
+                 man_logits=torch.cat(Lm_raw).numpy(),
+                 gaze_logits=torch.cat(Lg_raw).numpy(),
+                 ego_logits=torch.cat(Le_raw).numpy())
+        print(f"\n[dump] wrote {dump}")
+    print("\nper-maneuver breakdown")
+    print(classification_report(y, yh, zero_division=0, digits=3))
+    return y, yh, yg, ygh, ye, yeh
 
 def seed_all(seed):
     import random
@@ -39,15 +119,11 @@ def trainer(args, valid_subset, n_splits=5):
     ckp = torch.load(args.weights,map_location=device)
     
 
-    model.load_state_dict(ckp,strict=True)
+    model.load_state_dict(ckp,strict=not args.nonstrict)
     model.eval()
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
 
-    # drop_last=False + pad_collate: the final short batch is padded up to BATCH and the
-    # padded rows are masked out of the metrics, so all N samples are scored. Padding is
-    # mandatory rather than cosmetic -- first_model.tm.centers is (BATCH, K, 2048), so a
-    # partial batch is a shape error, which is why the original used drop_last=True.
     val_loader = torch.utils.data.DataLoader(
         valid_subset, batch_size=args.batch, shuffle=False, drop_last=False,
         pin_memory=True, num_workers=args.workers, collate_fn=pad_collate)
@@ -124,6 +200,9 @@ if __name__ == '__main__':
     parser.add_argument("--csv", type=str, default="DATA/val.csv")
     parser.add_argument("--seed", type=int, default=37)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("-nonstrict", action="store_true",
+                        help="load with strict=False. Needed for the released 'nosim' "
+                             "checkpoints, which predate first_model.tm.center_coord.")
     parser.add_argument("--ego_threshold", type=float, default=0.5)
     parser.add_argument("--dump", type=str, default=None)
     parser.add_argument("-no_composite_sim", action="store_true",
