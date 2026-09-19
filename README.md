@@ -216,7 +216,8 @@ python eval.py \
   --technique $TECH  \
   --n_attributes 17  \
   --multitask_classes 15 \
-  --clusters 10 \
+  --clusters 5 \
+  --csv DATA/val.csv \
   -ego_cbm -multitask -bottleneck
 ```
 
