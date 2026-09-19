@@ -17,6 +17,9 @@ class token_merging(nn.Module):
         K=clusters
         dim = 2048
         self.centers = torch.nn.Parameter(torch.randn(ori_shape[0], K, ori_shape[-1]))
+        # False reproduces the released "nosim" checkpoints (feature-cosine clustering only).
+        # Set True to enable the composite spatio-temporal similarity of Eq. 1 (full LTM).
+        self.use_composite_sim = False
         self.center_coord = torch.nn.Parameter(torch.randn(ori_shape[0],K,3))
 
     def ordering(self,tokens):
@@ -83,12 +86,12 @@ class token_merging(nn.Module):
         return cluster_centers
         
     def forward(self,x):
-        # uncomment this to use composite similarity block
-        
-        # labels = self.ordering(x) # first of all get the (x,y,t) indices for each token 
-        # x = self.distance(x,labels) # this should compute the distance matrix (N,N) x: (B,N,dim)
-        
-        # running without composite similarity block
-        x = self.cluster(x)
+        if getattr(self, "use_composite_sim", False):
+            # full LTM: composite distance over feature + spatial + temporal terms
+            labels = self.ordering(x)   # (x,y,t) index per token
+            x = self.distance(x, labels)
+        else:
+            # "nosim": feature-cosine clustering only
+            x = self.cluster(x)
 
         return x 

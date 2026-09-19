@@ -13,14 +13,28 @@ from utils.save_img import visualize
 from sklearn.metrics import accuracy_score, f1_score
 
 from model import build_model
-from tools.engine import train, val
+# NOTE: the original `from tools.engine import train, val` was already broken -- engine.py
+# has no `train`. Scoring now goes through score_model, so neither symbol is needed.
+from eval_daadx import pad_collate, score_model, BATCH
+
+def seed_all(seed):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 def trainer(args, valid_subset, n_splits=5):
 
+    seed_all(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     model = build_model(args)
     model.to(device)
+    model.first_model.tm.use_composite_sim = not args.no_composite_sim
+    print(f"[LTM] composite similarity = {model.first_model.tm.use_composite_sim}"
+          + ("  (nosim mode: -no_composite_sim)" if args.no_composite_sim else ""))
     #import pdb;pdb.set_trace()
     #checkpoint = "weights/dino_vitbase16_pretrain.pth"
     ckp = torch.load(args.weights,map_location=device)
@@ -31,15 +45,19 @@ def trainer(args, valid_subset, n_splits=5):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
 
-    val_loader = torch.utils.data.DataLoader(valid_subset, batch_size=args.batch,pin_memory=True,drop_last=True)
+    # drop_last=False + pad_collate: the final short batch is padded up to BATCH and the
+    # padded rows are masked out of the metrics, so all N samples are scored. Padding is
+    # mandatory rather than cosmetic -- first_model.tm.centers is (BATCH, K, 2048), so a
+    # partial batch is a shape error, which is why the original used drop_last=True.
+    val_loader = torch.utils.data.DataLoader(
+        valid_subset, batch_size=args.batch, shuffle=False, drop_last=False,
+        pin_memory=True, num_workers=args.workers, collate_fn=pad_collate)
+    print(f"[data] csv={args.csv}  samples with a front_view video present: {len(valid_subset)}")
 
     for param in model.parameters():
         param.requires_grad = False
 
-    # plot gradcam 
-    loss, preds = val(args, val_loader, model, device)
-
-    evaluate(args, loss, preds, val_loader)
+    score_model(model, val_loader, device, ego_threshold=args.ego_threshold, dump=args.dump)
 
 
 def evaluate(args, running_loss,preds, valid_dataloader):
@@ -104,6 +122,19 @@ if __name__ == '__main__':
     parser.add_argument("--multitask_classes", type = int, default=None) # for final classification along with action classificaiton
     parser.add_argument("--dropout", type = float, default= 0.45)
     parser.add_argument("--clusters",default=5,type=int)
+    parser.add_argument("--csv", type=str, default="DATA/val.csv")
+    parser.add_argument("--seed", type=int, default=37)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--ego_threshold", type=float, default=0.5)
+    parser.add_argument("--dump", type=str, default=None)
+    parser.add_argument("-no_composite_sim", action="store_true",
+                        help="DISABLE the full LTM composite spatio-temporal similarity "
+                             "(model/TM.py::use_composite_sim). Composite sim is ON by "
+                             "default here, matching train_sim.py. Pass this for the "
+                             "released 'nosim' checkpoints, which were trained with "
+                             "feature-cosine clustering only.")
+    parser.add_argument("-composite_sim", action="store_true",
+                        help="deprecated no-op; composite sim is now the default.")
     parser.add_argument("-bottleneck",  action="store_true", help="Enable bottleneck mode")
     parser.add_argument("-gaze_cbm", action="store_true", help="Enable gaze CBM mode")
     parser.add_argument("-ego_cbm", action="store_true", help="Enable ego CBM mode")
@@ -114,8 +145,8 @@ if __name__ == '__main__':
     home_dir = str(args.directory)
     cache_dir = os.path.join(home_dir, "./")
     
-    val_csv = "DATA/val.csv"
+    assert args.batch == BATCH, "batch must be 8 (tm.centers is (8, K, 2048))"
 
-    val_subset = CustomDataset(val_csv, debug=args.debug)
+    val_subset = CustomDataset(args.csv, debug=args.debug)
 
     trainer(args, val_subset)
